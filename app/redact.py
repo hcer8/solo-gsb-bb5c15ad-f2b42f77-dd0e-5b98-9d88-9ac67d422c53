@@ -12,11 +12,17 @@
 * **解析文档内 ``#/...`` $ref**：只接受片段形式的本地引用
   （``#`` 与 ``#/...`` JSON Pointer，RFC 6901），与引用依赖诊断一致，
   绝不访问网络或外部文件；
+* **``$ref`` 同级子规则按方言分别处理**：Draft 2019-09 / 2020-12（以及
+  未声明旧版形态、按现有方言判定为现代版本的 schema）中 ``$ref`` 只是
+  普通关键字，引用目标与节点上同级的对象属性、数组项、组合分支等
+  **同时生效**，全部参与遍历；Draft-04 / 06 / 07 等旧规范仍按纯跳转
+  语义忽略同级子规则。方言判定沿用 ``compat._is_modern_ref_dialect``；
 * **组合关键字**：``oneOf`` / ``anyOf`` 只遍历对**当前实例（原值）**
   校验通过的分支，``allOf`` 遍历全部分支；
 * **递归引用停止重复展开**：同一实例位置上，一个引用目标只展开一次
   （``#`` 自指、定义互引、链表式自引用均安全终止）；进入子实例位置后
-  引用展开计数重新开始；
+  引用展开计数重新开始。现代方言下即使引用目标已展开过而被跳过，节点
+  的同级子规则仍照常遍历，不会因跳过重复引用而漏脱敏；
 * 无法解析的引用（外部引用 / 名称片段 / 目标不存在 / 非法指针转义 /
   非字符串）抛出 :class:`UnresolvableReference`，由接口层转为带 schema
   指针的 ``422``。
@@ -31,7 +37,7 @@ import copy
 import re
 from typing import Any
 
-from app.compat import escape_pointer, make_validator
+from app.compat import escape_pointer, make_validator, _is_modern_ref_dialect
 from app.refgraph import (
     _classify_ref,
     _pointer_segments,
@@ -129,6 +135,10 @@ class _RedactionWalker:
         self.root_schema = root_schema
         # 选择校验器时尽量贴合 schema 声明的 draft（oneOf/anyOf 分支判定用）
         self.validator = make_validator(root_schema)
+        # $ref 同级子规则语义：True = 2019-09/2020-12 等现代方言
+        # （$ref 与同级约束同时生效）；False = Draft-07 及更早（忽略同级）。
+        # 判定方式与兼容性分析的 $ref 预展开保持一致，整个文档沿用同一方言。
+        self.modern_refs = _is_modern_ref_dialect(root_schema)
         self._replaced: set[str] = set()
         self.replacements: list[dict] = []
 
@@ -182,12 +192,19 @@ class _RedactionWalker:
         if "$ref" in node:
             target_pointer = self._classify(node, schema_pointer,
                                             instance_pointer)
-            if target_pointer in seen:
+            if target_pointer not in seen:
+                target = _node_at_pointer(self.root_schema, target_pointer)
+                self.collect(target, value, target_pointer,
+                             instance_pointer, seen | {target_pointer})
+            if not self.modern_refs:
+                # Draft-07 及更早：$ref 是纯跳转，同级子规则一律忽略；
+                # 引用目标成环被跳过时同样直接结束本节点
                 return
-            target = _node_at_pointer(self.root_schema, target_pointer)
-            self.collect(target, value, target_pointer,
-                         instance_pointer, seen | {target_pointer})
-            return
+            # 现代方言（2019-09/2020-12 及按现有形态判定的现代 schema）：
+            # $ref 只是普通关键字，引用目标之外的同级子规则（对象属性、
+            # 数组项、组合分支等）同样生效。即使引用目标已在 seen 中而
+            # 跳过展开，同级子规则仍须继续遍历，不能随重复引用一起跳过。
+            seen = seen | {target_pointer}
 
         # 组合分支：oneOf/anyOf 只保留对当前实例校验通过的分支，
         # allOf 遍历全部分支。判定基于尚未脱敏的原始实例值。

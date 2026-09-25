@@ -1322,6 +1322,76 @@ def test_redact_uses_new_schema_not_old(client):
     assert resp.json()["results"][0]["redacted"] == {"ssn": "123"}
 
 
+def test_redact_modern_dialect_ref_siblings_are_traversed(client):
+    # 2020-12：$ref 同级 properties / items / allOf 与引用目标同时生效；
+    # 成环被跳过的重复引用也不漏掉同级子规则
+    new_schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "base": {"$ref": "#/$defs/Base",
+                     "properties": {"extra": {"x-sensitive": True}}},
+            "arr": {"$ref": "#/$defs/Arr",
+                    "items": {"x-sensitive": True}},
+            "loop": {"$ref": "#/$defs/Node",
+                     "properties": {"mark": {"x-sensitive": True}}},
+        },
+        "$defs": {
+            "Base": {"type": "object",
+                     "properties": {"id": {"x-sensitive": True}}},
+            "Arr": {"type": "array", "items": {"type": "integer"}},
+            "Node": {"$ref": "#/$defs/Node"},  # 自环：重复引用只展开一次
+        },
+    }
+    resp = client.post("/api/analyses", json={
+        "old_schema": {"type": "object"},
+        "new_schema": new_schema,
+    })
+    analysis_id = resp.json()["id"]
+    doc = {"base": {"id": "x", "extra": "y"},
+           "arr": [1, 2],
+           "loop": {"mark": "secret"}}
+    resp = client.post(f"/api/analyses/{analysis_id}/redact",
+                       json={"documents": [doc]})
+    assert resp.status_code == 200, resp.text
+    result = resp.json()["results"][0]
+    assert result["redacted"] == {
+        "base": {"id": "***", "extra": "***"},
+        "arr": ["***", "***"],
+        "loop": {"mark": "***"},
+    }
+    pointers = {r["instance_pointer"]: r["schema_pointer"]
+                for r in result["replacements"]}
+    # 返回命中子规则的实际 schema 指针
+    assert pointers["#/base/extra"] == "#/properties/base/properties/extra"
+    assert pointers["#/base/id"] == "#/$defs/Base/properties/id"
+    assert pointers["#/loop/mark"] == "#/properties/loop/properties/mark"
+
+
+def test_redact_draft07_ignores_ref_siblings(client):
+    new_schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+            "base": {"$ref": "#/definitions/Base",
+                     "properties": {"extra": {"x-sensitive": True}}},
+        },
+        "definitions": {"Base": {"type": "object",
+                                 "properties": {"id": {"x-sensitive": True}}}},
+    }
+    resp = client.post("/api/analyses", json={
+        "old_schema": {"type": "object"},
+        "new_schema": new_schema,
+    })
+    analysis_id = resp.json()["id"]
+    resp = client.post(f"/api/analyses/{analysis_id}/redact",
+                       json={"documents": [{"base": {"id": "x", "extra": "y"}}]})
+    assert resp.status_code == 200, resp.text
+    # 旧方言：引用目标内 id 脱敏，同级 extra 保持原样
+    assert resp.json()["results"][0]["redacted"] == {
+        "base": {"id": "***", "extra": "y"}}
+
+
 # ---------------------------------------------------------------------------
 # POST /api/reference-diagnostics 引用依赖诊断（只读，不落库）
 # ---------------------------------------------------------------------------
