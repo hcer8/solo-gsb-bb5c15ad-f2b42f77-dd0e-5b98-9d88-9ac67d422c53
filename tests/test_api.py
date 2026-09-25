@@ -1322,6 +1322,87 @@ def test_redact_uses_new_schema_not_old(client):
     assert resp.json()["results"][0]["redacted"] == {"ssn": "123"}
 
 
+def test_redact_modern_ref_siblings_masked_with_schema_pointer(client):
+    # 2020-12：$ref 同级的对象属性 / 数组项 / 组合分支都参与遍历，
+    # 并返回实际命中的 schema_pointer
+    new_schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "data": {
+                "$ref": "#/$defs/Base",
+                "properties": {"extra": {"x-sensitive": True}},
+            },
+            "arr": {
+                "$ref": "#/$defs/Arr",
+                "items": {"x-sensitive": True},
+            },
+            "combo": {
+                "$ref": "#/$defs/Base",
+                "allOf": [{"properties": {"a": {"x-sensitive": True}}}],
+            },
+        },
+        "$defs": {
+            "Base": {"type": "object",
+                     "properties": {"keep": {"type": "string"}}},
+            "Arr": {"type": "array"},
+        },
+    }
+    resp = client.post("/api/analyses", json={
+        "name": "redact-modern-ref-siblings",
+        "old_schema": {"type": "object"},
+        "new_schema": new_schema,
+    })
+    analysis_id = resp.json()["id"]
+    resp = client.post(f"/api/analyses/{analysis_id}/redact", json={
+        "documents": [
+            {"data": {"keep": "v", "extra": "shh"},
+             "arr": [1, 2],
+             "combo": {"keep": "v", "a": 9}},
+        ]})
+    assert resp.status_code == 200, resp.text
+    result = resp.json()["results"][0]
+    assert result["redacted"] == {
+        "data": {"keep": "v", "extra": "***"},
+        "arr": ["***", "***"],
+        "combo": {"keep": "v", "a": "***"},
+    }
+    pointers = {(r["instance_pointer"], r["schema_pointer"])
+                for r in result["replacements"]}
+    assert ("#/data/extra",
+            "#/properties/data/properties/extra") in pointers
+    assert ("#/arr/0", "#/properties/arr/items") in pointers
+    assert ("#/combo/a",
+            "#/properties/combo/allOf/0/properties/a") in pointers
+
+
+def test_redact_draft07_ref_siblings_ignored(client):
+    new_schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+            "data": {
+                "$ref": "#/$defs/Base",
+                "properties": {"extra": {"x-sensitive": True}},
+            },
+        },
+        "$defs": {"Base": {"properties": {"keep": {"type": "string"}}}},
+    }
+    resp = client.post("/api/analyses", json={
+        "name": "redact-draft07-ref-siblings",
+        "old_schema": {"type": "object"},
+        "new_schema": new_schema,
+    })
+    analysis_id = resp.json()["id"]
+    resp = client.post(f"/api/analyses/{analysis_id}/redact",
+                       json={"documents": [{"data": {"keep": "v", "extra": 1}}]})
+    assert resp.status_code == 200, resp.text
+    result = resp.json()["results"][0]
+    # Draft-07：$ref 同级 properties 被忽略，extra 保持原值
+    assert result["redacted"] == {"data": {"keep": "v", "extra": 1}}
+    assert result["replacements"] == []
+
+
 # ---------------------------------------------------------------------------
 # POST /api/reference-diagnostics 引用依赖诊断（只读，不落库）
 # ---------------------------------------------------------------------------

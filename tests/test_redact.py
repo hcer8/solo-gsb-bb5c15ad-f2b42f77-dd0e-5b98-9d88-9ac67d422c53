@@ -5,6 +5,8 @@ additionalProperties / prefixItems / 元组 items / additionalItems）、
 本地 ``$ref`` 解析、oneOf/anyOf 仅遍历校验通过分支、allOf 全分支、
 递归引用终止、组合分支与 properties 的重复命中去重、指针转义、
 原始入参与 schema 不被修改、以及无法解析引用的异常与 schema 指针。
+新方言（2019-09/2020-12 及按形态判定为现代版本）下 ``$ref`` 的同级
+子规则参与遍历，Draft-07 及更早版本仍忽略同级子规则。
 """
 import pytest
 
@@ -228,6 +230,219 @@ def test_name_fragment_ref_rejected():
     with pytest.raises(redact.UnresolvableReference) as exc:
         redact.redact_documents(schema, [{"x": 1}])
     assert exc.value.reason == "name_fragment_unsupported"
+
+
+# ---------------------------------------------------------------------------
+# $ref 同级子规则（新方言生效，Draft-07 及更早忽略）
+# ---------------------------------------------------------------------------
+
+
+MODERN_SCHEMAS = (
+    "https://json-schema.org/draft/2020-12/schema",
+    "https://json-schema.org/draft/2019-09/schema",
+)
+
+
+def test_modern_ref_sibling_properties_traversed():
+    for declared in MODERN_SCHEMAS:
+        schema = {
+            "$schema": declared,
+            "type": "object",
+            "properties": {"data": {
+                "$ref": "#/$defs/Base",
+                "properties": {"extra": {"x-sensitive": True}},
+            }},
+            "$defs": {"Base": {"properties": {"name": {}}}},
+        }
+        result = redacted(schema, {"data": {"name": "alice", "extra": "shh"}})
+        assert result["redacted"] == {
+            "data": {"name": "alice", "extra": "***"}}
+        assert result["replacements"] == [{
+            "instance_pointer": "#/data/extra",
+            "schema_pointer": "#/properties/data/properties/extra",
+        }]
+
+
+def test_modern_ref_sibling_array_items_traversed():
+    schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {"arr": {
+            "$ref": "#/$defs/Arr",
+            "prefixItems": [{"x-sensitive": True}, {}],
+            "items": {"x-sensitive": True},
+        }},
+        "$defs": {"Arr": {"type": "array"}},
+    }
+    result = redacted(schema, {"arr": [1, 2, 3]})
+    assert result["redacted"] == {"arr": ["***", 2, "***"]}
+    ptrs = {(r["instance_pointer"], r["schema_pointer"])
+            for r in result["replacements"]}
+    assert ptrs == {
+        ("#/arr/0", "#/properties/arr/prefixItems/0"),
+        ("#/arr/2", "#/properties/arr/items"),
+    }
+
+
+def test_modern_ref_sibling_pattern_and_additional_properties():
+    schema = {
+        "$schema": "https://json-schema.org/draft/2019-09/schema",
+        "properties": {"data": {
+            "$ref": "#/$defs/Base",
+            "patternProperties": {"^sec_": {"x-sensitive": True}},
+            "additionalProperties": {
+                "properties": {"v": {"x-sensitive": True}}},
+        }},
+        "$defs": {"Base": {"type": "object"}},
+    }
+    result = redacted(schema, {"data": {"sec_a": 1, "other": {"v": 2}}})
+    assert result["redacted"] == {
+        "data": {"sec_a": "***", "other": {"v": "***"}}}
+
+
+def test_modern_ref_sibling_composition_branches_traversed():
+    schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {"data": {
+            "$ref": "#/$defs/Base",
+            "allOf": [{"properties": {"a": {"x-sensitive": True}}}],
+            "oneOf": [
+                {"properties": {"kind": {"const": "x"},
+                                "b": {"x-sensitive": True}},
+                 "required": ["kind"]},
+                {"properties": {"kind": {"const": "y"}},
+                 "required": ["kind"]},
+            ],
+        }},
+        "$defs": {"Base": {"type": "object"}},
+    }
+    result = redacted(schema, {"data": {"kind": "x", "a": 1, "b": 2}})
+    assert result["redacted"] == {
+        "data": {"kind": "x", "a": "***", "b": "***"}}
+    ptrs = {r["schema_pointer"] for r in result["replacements"]}
+    assert ptrs == {
+        "#/properties/data/allOf/0/properties/a",
+        "#/properties/data/oneOf/0/properties/b",
+    }
+
+
+def test_modern_ref_target_and_sibling_both_redact():
+    """引用目标内部与同级子规则命中的字段都应脱敏。"""
+    schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {"data": {
+            "$ref": "#/$defs/Base",
+            "properties": {"extra": {"x-sensitive": True}},
+        }},
+        "$defs": {"Base": {
+            "properties": {"base_secret": {"x-sensitive": True}}}},
+    }
+    result = redacted(schema, {"data": {"base_secret": 1, "extra": 2}})
+    assert result["redacted"] == {
+        "data": {"base_secret": "***", "extra": "***"}}
+    ptrs = {r["schema_pointer"] for r in result["replacements"]}
+    assert ptrs == {
+        "#/$defs/Base/properties/base_secret",
+        "#/properties/data/properties/extra",
+    }
+
+
+def test_undeclared_modern_form_traverses_siblings():
+    """未声明 $schema 且无旧形态标记时，按现代方言处理同级子规则。"""
+    schema = {
+        "properties": {"data": {
+            "$ref": "#/$defs/Base",
+            "properties": {"extra": {"x-sensitive": True}},
+        }},
+        "$defs": {"Base": {"properties": {"name": {}}}},
+    }
+    result = redacted(schema, {"data": {"name": "a", "extra": 2}})
+    assert result["redacted"] == {"data": {"name": "a", "extra": "***"}}
+
+
+def test_draft07_ref_siblings_ignored():
+    schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {"data": {
+            "$ref": "#/$defs/Base",
+            "properties": {"extra": {"x-sensitive": True}},
+            "items": {"x-sensitive": True},
+            "allOf": [{"properties": {"a": {"x-sensitive": True}}}],
+        }},
+        "$defs": {"Base": {"properties": {"name": {}}}},
+    }
+    result = redacted(schema, {"data": {"name": "a", "extra": 2, "a": 3}})
+    assert result["redacted"] == {"data": {"name": "a", "extra": 2, "a": 3}}
+    assert result["replacements"] == []
+
+
+def test_legacy_tuple_form_ref_siblings_ignored():
+    """无 $schema 但出现 draft-04/06/07 元组写法时，按旧方言忽略同级。"""
+    schema = {
+        "properties": {"data": {
+            "$ref": "#/$defs/Base",
+            "properties": {"extra": {"x-sensitive": True}},
+        }},
+        "$defs": {"Base": {"items": [{}]}},
+    }
+    result = redacted(schema, {"data": {"extra": 2}})
+    assert result["redacted"] == {"data": {"extra": 2}}
+    assert result["replacements"] == []
+
+
+def test_skipped_cyclic_ref_still_traverses_siblings():
+    """循环引用目标只展开一次，但跳过展开不跳过节点的同级子规则。"""
+    schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {"x": {
+            "$ref": "#/$defs/A",
+            "properties": {"s": {"x-sensitive": True}},
+        }},
+        "$defs": {
+            "A": {"$ref": "#/$defs/B"},
+            "B": {"$ref": "#/$defs/A"},
+        },
+    }
+    result = redacted(schema, {"x": {"s": 7}})
+    assert result["redacted"] == {"x": {"s": "***"}}
+    assert result["replacements"][0]["schema_pointer"] == \
+        "#/properties/x/properties/s"
+
+
+def test_duplicate_ref_at_same_instance_position_covers_siblings():
+    """同一实例位置经由组合分支已展开过的目标，再次 $ref 时同级仍遍历。"""
+    schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "allOf": [{"$ref": "#/$defs/X"}],
+        "properties": {
+            "b": {"$ref": "#/$defs/X",
+                  "properties": {"s": {"x-sensitive": True}}},
+        },
+        "$defs": {"X": {"type": "object"}},
+    }
+    # allOf 分支在实例 # 处展开 #/$defs/X 后，#/properties/b 是新的实例
+    # 位置（seen 重置）；这里再验证 # 位置自身：节点 $ref 目标虽在 seen
+    # 链上，同级 properties 结构遍历不受影响
+    result = redacted(schema, {"b": {"s": 9}})
+    assert result["redacted"] == {"b": {"s": "***"}}
+
+
+def test_modern_self_ref_sibling_at_same_position():
+    """``#`` 自指在同一实例位置跳过重复展开，但同级子规则仍生效。"""
+    schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "self": {
+                "$ref": "#",
+                "properties": {"secret": {"x-sensitive": True}},
+            },
+        },
+    }
+    result = redacted(schema, {"self": {"secret": 1}})
+    assert result["redacted"] == {"self": {"secret": "***"}}
+    assert result["replacements"][0]["schema_pointer"] == \
+        "#/properties/self/properties/secret"
 
 
 # ---------------------------------------------------------------------------

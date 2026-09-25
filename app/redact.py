@@ -11,12 +11,19 @@
   ``additionalItems`` / 数组写法 ``items`` 均按实例实际结构下钻；
 * **解析文档内 ``#/...`` $ref**：只接受片段形式的本地引用
   （``#`` 与 ``#/...`` JSON Pointer，RFC 6901），与引用依赖诊断一致，
-  绝不访问网络或外部文件；
+  绝不访问网络或外部文件。新方言（Draft 2019-09/2020-12，及未声明
+  ``$schema`` 但按形态判定为现代版本时）下 ``$ref`` 只是普通关键字，
+  引用目标与**同节点的同级子规则**（``properties`` /
+  ``patternProperties`` / ``additionalProperties`` 等对象属性、
+  ``prefixItems`` / ``items`` / ``additionalItems`` 数组项、
+  ``allOf`` / ``oneOf`` / ``anyOf`` 组合分支）同时生效，均参与遍历；
+  Draft-07 及更早方言中 ``$ref`` 是纯跳转，同级子规则被忽略；
 * **组合关键字**：``oneOf`` / ``anyOf`` 只遍历对**当前实例（原值）**
   校验通过的分支，``allOf`` 遍历全部分支；
 * **递归引用停止重复展开**：同一实例位置上，一个引用目标只展开一次
-  （``#`` 自指、定义互引、链表式自引用均安全终止）；进入子实例位置后
-  引用展开计数重新开始；
+  （``#`` 自指、定义互引、链表式自引用均安全终止）；跳过重复展开不会
+  跳过该节点的同级子规则（新方言下 ``$ref`` 同级结构始终照常遍历）；
+  进入子实例位置后引用展开计数重新开始；
 * 无法解析的引用（外部引用 / 名称片段 / 目标不存在 / 非法指针转义 /
   非字符串）抛出 :class:`UnresolvableReference`，由接口层转为带 schema
   指针的 ``422``。
@@ -31,7 +38,7 @@ import copy
 import re
 from typing import Any
 
-from app.compat import escape_pointer, make_validator
+from app.compat import _is_modern_ref_dialect, escape_pointer, make_validator
 from app.refgraph import (
     _classify_ref,
     _pointer_segments,
@@ -129,6 +136,10 @@ class _RedactionWalker:
         self.root_schema = root_schema
         # 选择校验器时尽量贴合 schema 声明的 draft（oneOf/anyOf 分支判定用）
         self.validator = make_validator(root_schema)
+        # $ref 同级子规则是否参与遍历：沿用兼容性分析的方言判定——
+        # Draft 2019-09/2020-12（及未声明但形态为新版）中 $ref 与同级
+        # 约束同时生效；Draft-07 及更早版本同级子规则被忽略
+        self.modern_refs = _is_modern_ref_dialect(root_schema)
         self._replaced: set[str] = set()
         self.replacements: list[dict] = []
 
@@ -167,8 +178,13 @@ class _RedactionWalker:
         return next(branch_validator.iter_errors(value), None) is None
 
     def collect(self, node: Any, value: Any, schema_pointer: str,
-                instance_pointer: str, seen: frozenset[str]) -> None:
-        """按 schema 节点 ``node`` 遍历原始实例 ``value``，收集脱敏位置。"""
+                instance_pointer: str, seen: set[str]) -> None:
+        """按 schema 节点 ``node`` 遍历原始实例 ``value``，收集脱敏位置。
+
+        ``seen`` 是**当前实例位置**上已经展开过的引用目标集合，在同一
+        实例位置的各条遍历路径（含同级结构与组合分支）间共享；进入子
+        属性 / 数组元素等子实例位置时由调用方传入全新的空集合。
+        """
         # 布尔 schema：true 无约束、false 拒绝一切，均无 x-sensitive
         if node is True or node is False or not isinstance(node, dict):
             return
@@ -178,16 +194,25 @@ class _RedactionWalker:
             self._record(instance_pointer, schema_pointer)
             return
 
-        # $ref 解析；同一实例位置的重复递归引用停止再次展开
+        # $ref 解析；同一实例位置上同一引用目标只展开一次（跨同级结构与
+        # 组合分支共享 seen，不只是单条遍历链）。新方言（2019-09/2020-12
+        # 及按形态判定的现代版本）下 $ref 只是普通关键字：展开引用目标
+        # 后，节点自身的同级子规则（对象属性、数组项、组合分支等）仍须
+        # 照常遍历；旧方言（Draft-07 及更早）下 $ref 是纯跳转，同级子
+        # 规则被忽略。
         if "$ref" in node:
             target_pointer = self._classify(node, schema_pointer,
                                             instance_pointer)
-            if target_pointer in seen:
+            if target_pointer not in seen:
+                seen.add(target_pointer)
+                target = _node_at_pointer(self.root_schema, target_pointer)
+                self.collect(target, value, target_pointer,
+                             instance_pointer, seen)
+            # 即使目标已在 seen 中（嵌套 / 循环 / 经由其他分支重复的引用
+            # 跳过展开），新方言下也不能 return：下方的结构遍历仍须覆盖
+            # 本节点的同级子规则
+            if not self.modern_refs:
                 return
-            target = _node_at_pointer(self.root_schema, target_pointer)
-            self.collect(target, value, target_pointer,
-                         instance_pointer, seen | {target_pointer})
-            return
 
         # 组合分支：oneOf/anyOf 只保留对当前实例校验通过的分支，
         # allOf 遍历全部分支。判定基于尚未脱敏的原始实例值。
@@ -224,7 +249,7 @@ class _RedactionWalker:
     # ------------------------------------------------------------------
 
     def _collect_object(self, node: dict, value: dict, schema_pointer: str,
-                        instance_pointer: str, seen: frozenset[str],
+                        instance_pointer: str, seen: set[str],
                         branches: list[tuple[Any, str]]) -> None:
         properties = node.get("properties")
         properties = properties if isinstance(properties, dict) else {}
@@ -263,16 +288,17 @@ class _RedactionWalker:
                     (additional, f"{schema_pointer}/additionalProperties"))
 
             for sub, sub_pointer in sub_schemas:
-                self.collect(sub, item, sub_pointer, item_pointer, frozenset())
+                # 进入子实例位置：引用展开计数重新开始
+                self.collect(sub, item, sub_pointer, item_pointer, set())
 
         # 组合分支可能在 properties 之外补充约束（分支内 properties /
-        # 直接 x-sensitive 等）；seen 沿同层组合分支继续传播
+        # 直接 x-sensitive 等）；seen 是同一实例位置共享的展开记录
         for branch, branch_pointer in branches:
             self.collect(branch, value, branch_pointer,
                          instance_pointer, seen)
 
     def _collect_array(self, node: dict, value: list, schema_pointer: str,
-                       instance_pointer: str, seen: frozenset[str],
+                       instance_pointer: str, seen: set[str],
                        branches: list[tuple[Any, str]]) -> None:
         prefix_items = node.get("prefixItems")
         legacy_tuple = False
@@ -287,25 +313,25 @@ class _RedactionWalker:
                 if index < len(prefix_items):
                     self.collect(prefix_items[index], item,
                                  f"{schema_pointer}/{tuple_keyword}/{index}",
-                                 item_pointer, frozenset())
+                                 item_pointer, set())
                 elif legacy_tuple:
                     rest = node.get("additionalItems", True)
                     if rest is not True:
                         self.collect(rest, item,
                                      f"{schema_pointer}/additionalItems",
-                                     item_pointer, frozenset())
+                                     item_pointer, set())
                 else:
                     rest = node.get("items", True)
                     if rest is not True:
                         self.collect(rest, item, f"{schema_pointer}/items",
-                                     item_pointer, frozenset())
+                                     item_pointer, set())
         else:
             items = node.get("items")
             if isinstance(items, dict):
                 for index, item in enumerate(value):
                     self.collect(items, item, f"{schema_pointer}/items",
                                  _child_pointer(instance_pointer, index),
-                                 frozenset())
+                                 set())
 
         for branch, branch_pointer in branches:
             self.collect(branch, value, branch_pointer,
@@ -327,7 +353,7 @@ def redact_documents(schema: Any, documents: list[Any]) -> dict:
     results: list[dict] = []
     for index, document in enumerate(documents):
         walker = _RedactionWalker(schema)
-        walker.collect(schema, document, "#", "#", frozenset())
+        walker.collect(schema, document, "#", "#", set())
         # walker 已按实例位置去重；这里仅按实例指针做与遍历路径无关的
         # 确定性排序（数组下标段按数值比较）
         replacements = sorted(walker.replacements,
